@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+.ipynb_checkpoints/
+
+# Data and generated artifacts (large / regenerable, not checked in)
+data/raw/
+checkpoints/
+results/
