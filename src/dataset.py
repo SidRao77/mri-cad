@@ -4,7 +4,8 @@ dataset.py
 Handles everything related to loading the brain MRI dataset:
   1. Finding the image files on disk (auto-detecting how the Kaggle
      download landed under data/raw/ — flat or nested a level deeper).
-  2. Splitting them into stratified train/val/test sets (70/15/15).
+  2. Splitting them into stratified train/val/test sets (70/15/15),
+     keeping near-duplicate images together so none leak across splits.
   3. Wrapping them in a PyTorch Dataset + DataLoader with the right
      transforms: resize to 224x224, ImageNet normalization, and light
      augmentation for the training set only.
@@ -22,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedGroupKFold
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 
@@ -165,37 +166,83 @@ class BrainMRIDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# Stratified split
+# Duplicate grouping
+#
+# The Kaggle dataset contains the same scan saved several times under
+# different filenames (byte-identical copies and re-encoded ones). If copies
+# of one scan land in both train and test, the model is effectively tested
+# on images it memorized, inflating accuracy and confidence. We group
+# near-identical images with a perceptual hash and keep each group together
+# in a single split.
+# ---------------------------------------------------------------------------
+DUPLICATE_HASH_THRESHOLD = 6  # max differing bits (of 240) to count as a duplicate
+
+
+def dhash(path: Path) -> np.ndarray:
+    """Difference hash: 240 bits encoding left-to-right brightness gradients."""
+    gray = np.asarray(Image.open(path).convert("L").resize((17, 16)), dtype=np.int16)
+    return (gray[:, 1:] > gray[:, :-1]).flatten()
+
+
+def duplicate_groups(samples, threshold=DUPLICATE_HASH_THRESHOLD) -> np.ndarray:
+    """
+    Return an integer group id per sample, where samples whose hashes are
+    within `threshold` bits of each other (directly or through a chain of
+    near-matches) share a group.
+    """
+    hashes = np.array([dhash(path) for path, _ in samples])
+    distances = (hashes[:, None, :] != hashes[None, :, :]).sum(axis=-1)
+
+    # Union-find over all near-duplicate pairs.
+    parent = list(range(len(samples)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i, j in zip(*np.where(np.triu(distances <= threshold, k=1))):
+        parent[find(i)] = find(j)
+
+    return np.array([find(i) for i in range(len(samples))])
+
+
+# ---------------------------------------------------------------------------
+# Stratified, duplicate-aware split
 # ---------------------------------------------------------------------------
 def stratified_split(samples, train_frac=0.7, val_frac=0.15, seed=SEED):
     """
     Split (path, label) samples into train/val/test lists, preserving the
-    class balance in each split (stratified sampling), using a fixed seed
-    for reproducibility.
+    class balance in each split (stratified sampling) and keeping every
+    group of near-duplicate images inside a single split, using a fixed
+    seed for reproducibility.
     """
-    labels = [label for _, label in samples]
+    groups = duplicate_groups(samples)
+    labels = np.array([label for _, label in samples])
+    test_frac = 1 - train_frac - val_frac
 
-    # First split off the training set...
-    train_samples, remainder = train_test_split(
-        samples,
-        train_size=train_frac,
-        stratify=labels,
-        random_state=seed,
+    # Carve off the test set as one fold of a stratified group k-fold,
+    # with k chosen so one fold is roughly test_frac of the data...
+    rest_idx, test_idx = group_fold(labels, groups, round(1 / test_frac), seed)
+
+    # ...then carve val out of the remainder the same way. val_frac was a
+    # fraction of the *original* total, so convert it to a fraction of
+    # the remainder first.
+    relative_val_frac = val_frac / (train_frac + val_frac)
+    train_sub, val_sub = group_fold(
+        labels[rest_idx], groups[rest_idx], round(1 / relative_val_frac), seed
     )
+    train_idx, val_idx = rest_idx[train_sub], rest_idx[val_sub]
 
-    # ...then split what's left evenly into val/test. val_frac was a
-    # fraction of the *original* total, so we convert it to a fraction
-    # of the remainder before splitting again.
-    remainder_labels = [label for _, label in remainder]
-    relative_val_frac = val_frac / (1 - train_frac)
-    val_samples, test_samples = train_test_split(
-        remainder,
-        train_size=relative_val_frac,
-        stratify=remainder_labels,
-        random_state=seed,
-    )
+    pick = lambda idx: [samples[i] for i in idx]
+    return pick(train_idx), pick(val_idx), pick(test_idx)
 
-    return train_samples, val_samples, test_samples
+
+def group_fold(labels, groups, n_splits, seed):
+    """Return (rest, held_out) index arrays for the first stratified group fold."""
+    splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    return next(splitter.split(np.zeros(len(labels)), labels, groups))
 
 
 # ---------------------------------------------------------------------------
