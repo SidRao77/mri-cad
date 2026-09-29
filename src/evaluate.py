@@ -2,8 +2,12 @@
 evaluate.py
 
 Loads the best saved checkpoint and evaluates it on the held-out test set:
-  - Reports accuracy, precision, recall, F1, and ROC-AUC.
-  - Saves a confusion matrix plot and an ROC curve plot to results/.
+  - Reports accuracy (with a bootstrap 95% CI — the test set is small),
+    precision, recall, F1, and ROC-AUC.
+  - Reports calibration — whether the model's confidence matches how often
+    it's actually right — before and after temperature scaling: expected
+    calibration error (ECE), negative log-likelihood, and Brier score.
+  - Saves a confusion matrix, ROC curve, and reliability diagram to results/.
   - Prints a short summary emphasizing recall, since in this context a
     missed tumor (false negative) is more costly than a false alarm
     (false positive).
@@ -17,6 +21,7 @@ import os
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn.functional as F
 from sklearn.metrics import (
@@ -29,40 +34,47 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 
+from calibration import (
+    collect_logits,
+    expected_calibration_error,
+    load_temperature,
+    plot_reliability_diagram,
+)
 from dataset import get_dataloaders, set_seed
 from model import build_model, get_device
 
 CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "..", "checkpoints", "best_model.pt")
 CONFUSION_MATRIX_PATH = os.path.join(os.path.dirname(__file__), "..", "results", "confusion_matrix.png")
 ROC_CURVE_PATH = os.path.join(os.path.dirname(__file__), "..", "results", "roc_curve.png")
+RELIABILITY_PATH = os.path.join(os.path.dirname(__file__), "..", "results", "reliability_diagram.png")
 
 CLASS_NAMES = ["no", "yes"]  # index 0 = no tumor, index 1 = tumor
 
 
-def get_predictions(model, loader, device):
-    """
-    Run the model over every batch in `loader` and collect true labels,
-    predicted labels, and predicted probability of the "yes" (tumor) class
-    for every example — everything the metrics below need.
-    """
-    model.eval()
+def calibration_report(logits, labels, temperature):
+    """Print ECE / NLL / Brier and the share of near-certain predictions."""
+    probs = F.softmax(logits / temperature, dim=1)
+    confidences, preds = probs.max(dim=1)
+    correct = (preds == labels).numpy()
+    confidences = confidences.numpy()
 
-    all_labels = []
-    all_preds = []
-    all_probs = []  # probability of class 1 ("yes"), used for ROC-AUC
+    ece = expected_calibration_error(confidences, correct)
+    nll = F.cross_entropy(logits / temperature, labels).item()
+    brier = ((probs[:, 1] - labels.float()) ** 2).mean().item()
+    print(
+        f"  T={temperature:.3f}: mean confidence {confidences.mean():.3f} vs accuracy "
+        f"{correct.mean():.3f} | ECE {ece:.3f} | NLL {nll:.3f} | Brier {brier:.3f} | "
+        f"{(confidences >= 0.99).mean():.0%} of predictions at >=99% confidence"
+    )
+    return confidences, correct
 
-    with torch.no_grad():
-        for images, labels in loader:
-            images = images.to(device)
-            outputs = model(images)
-            probs = F.softmax(outputs, dim=1)[:, 1]  # P(tumor)
-            preds = outputs.argmax(dim=1)
 
-            all_labels.extend(labels.tolist())
-            all_preds.extend(preds.cpu().tolist())
-            all_probs.extend(probs.cpu().tolist())
-
-    return all_labels, all_preds, all_probs
+def bootstrap_accuracy_ci(correct, n_resamples=5000, seed=0):
+    """95% bootstrap confidence interval for accuracy."""
+    rng = np.random.default_rng(seed)
+    correct = np.asarray(correct, dtype=float)
+    resampled = [correct[rng.integers(0, len(correct), len(correct))].mean() for _ in range(n_resamples)]
+    return np.percentile(resampled, 2.5), np.percentile(resampled, 97.5)
 
 
 def plot_confusion_matrix(labels, preds, save_path):
@@ -122,23 +134,34 @@ def main():
     model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
     print(f"Loaded checkpoint from {CHECKPOINT_PATH}")
 
-    labels, preds, probs = get_predictions(model, test_loader, device)
+    temperature = load_temperature()
+
+    logits, label_tensor = collect_logits(model, test_loader, device)
+    labels = label_tensor.tolist()
+    preds = logits.argmax(dim=1).tolist()
+    probs = F.softmax(logits / temperature, dim=1)[:, 1].tolist()  # P(tumor), calibrated
 
     accuracy = accuracy_score(labels, preds)
     precision = precision_score(labels, preds)
     recall = recall_score(labels, preds)
     f1 = f1_score(labels, preds)
     auc = roc_auc_score(labels, probs)
+    ci_low, ci_high = bootstrap_accuracy_ci(np.array(labels) == np.array(preds))
 
-    print("\nTest set metrics:")
-    print(f"  Accuracy:  {accuracy:.4f}")
+    print(f"\nTest set metrics (n={len(labels)}):")
+    print(f"  Accuracy:  {accuracy:.4f}  (95% CI {ci_low:.3f}-{ci_high:.3f})")
     print(f"  Precision: {precision:.4f}")
     print(f"  Recall:    {recall:.4f}")
     print(f"  F1:        {f1:.4f}")
     print(f"  ROC-AUC:   {auc:.4f}")
 
+    print("\nCalibration (does confidence match accuracy? lower ECE/NLL/Brier is better):")
+    calibration_report(logits, label_tensor, 1.0)
+    confidences, correct = calibration_report(logits, label_tensor, temperature)
+
     plot_confusion_matrix(labels, preds, CONFUSION_MATRIX_PATH)
     plot_roc_curve(labels, probs, ROC_CURVE_PATH)
+    plot_reliability_diagram(confidences, correct, RELIABILITY_PATH)
 
     cm = confusion_matrix(labels, preds)
     false_negatives = cm[1, 0]  # actual tumor, predicted no tumor
