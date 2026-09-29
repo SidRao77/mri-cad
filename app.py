@@ -27,6 +27,7 @@ from PIL import Image
 # no duplicated logic that could drift out of sync.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
+from calibration import load_temperature  # noqa: E402
 from dataset import eval_transform  # noqa: E402
 from model import build_model, get_device  # noqa: E402
 from gradcam import build_gradcam, overlay_heatmap  # noqa: E402
@@ -34,6 +35,12 @@ from gradcam import build_gradcam, overlay_heatmap  # noqa: E402
 CHECKPOINT_PATH = Path(__file__).resolve().parent / "checkpoints" / "best_model.pt"
 
 CLASS_LABELS = {0: "No Tumor Detected", 1: "Tumor Detected"}
+
+# Confidence display bounds. A model trained on ~250 images can't justify
+# claims more precise than this, so we cap the readout instead of showing
+# "100.0%", and flag readings close to a coin flip for extra caution.
+MAX_DISPLAY_CONFIDENCE = 0.99
+LOW_CONFIDENCE_THRESHOLD = 0.75
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +54,7 @@ def load_model():
     model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
     model.eval()
     gradcam = build_gradcam(model)
-    return model, gradcam, device
+    return model, gradcam, device, load_temperature()
 
 
 def image_to_base64(image: Image.Image) -> str:
@@ -57,22 +64,25 @@ def image_to_base64(image: Image.Image) -> str:
     return base64.b64encode(buffer.getvalue()).decode()
 
 
-def run_prediction(image: Image.Image, model, gradcam, device):
+def run_prediction(image: Image.Image, model, gradcam, device, temperature):
     """Preprocess the image, run inference, and generate a Grad-CAM overlay."""
     input_tensor = eval_transform(image.convert("RGB")).unsqueeze(0).to(device)
 
+    # Divide logits by the fitted temperature so the reported confidence is
+    # calibrated (see src/calibration.py). This never changes the prediction.
     with torch.no_grad():
         logits = model(input_tensor)
-        probs = F.softmax(logits, dim=1).squeeze(0).cpu()
+        probs = F.softmax(logits / temperature, dim=1).squeeze(0).cpu()
+    predicted_class = probs.argmax().item()
 
     # Grad-CAM needs its own forward+backward pass (it needs gradients),
     # so it's run separately from the no_grad inference above.
-    heatmap, predicted_class, confidence = gradcam.generate(input_tensor)
+    heatmap, _, _ = gradcam.generate(input_tensor, target_class=predicted_class)
     overlay = overlay_heatmap(image, heatmap)
 
     return {
         "predicted_class": predicted_class,
-        "confidence": confidence,
+        "confidence": probs[predicted_class].item(),
         "probs": probs,
         "overlay": overlay,
     }
@@ -334,8 +344,8 @@ else:
         width, height = image.size
 
         with st.spinner("Running inference..."):
-            model, gradcam, device = load_model()
-            result = run_prediction(image, model, gradcam, device)
+            model, gradcam, device, temperature = load_model()
+            result = run_prediction(image, model, gradcam, device, temperature)
 
         predicted_class = result["predicted_class"]
         confidence = result["confidence"]
@@ -381,16 +391,24 @@ else:
             "This is a research model's output, not a diagnosis — any real finding "
             "requires review by a qualified radiologist."
         )
+        if confidence < LOW_CONFIDENCE_THRESHOLD:
+            note = "Low-confidence reading — the model is uncertain about this scan. " + note
+
+        shown_confidence = min(confidence, MAX_DISPLAY_CONFIDENCE)
+        conf_text = (
+            f"&gt;{MAX_DISPLAY_CONFIDENCE:.0%}" if confidence > MAX_DISPLAY_CONFIDENCE
+            else f"{confidence:.0%}"
+        )
 
         st.markdown(f"""
         <div class="findings-bar">
             <div class="findings-row">
                 <span class="status-dot" style="background: {dot_color};"></span>
                 <span class="status-label" style="color: {label_color};">{status_text}</span>
-                <span class="conf-readout">{confidence * 100:.1f}%</span>
+                <span class="conf-readout">{conf_text}</span>
             </div>
             <div class="conf-track">
-                <div class="conf-fill" style="width: {confidence * 100:.1f}%; background: {fill_color};"></div>
+                <div class="conf-fill" style="width: {shown_confidence * 100:.1f}%; background: {fill_color};"></div>
             </div>
             <div class="findings-meta">ResNet18 &middot; fine-tuned &middot; attention basis: Grad-CAM, final residual block</div>
             <div class="findings-note">{note}</div>
